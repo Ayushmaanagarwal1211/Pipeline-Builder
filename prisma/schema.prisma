@@ -1,0 +1,118 @@
+// NextFlow database schema
+// PostgreSQL (Neon) via Prisma.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// -----------------------------------------------------------------------------
+// Users — `id` will be the Clerk user id once auth is wired.
+// -----------------------------------------------------------------------------
+
+model User {
+  id        String     @id
+  email     String?    @unique
+  name      String?
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  workflows Workflow[]
+  runs      WorkflowRun[]
+
+  @@map("users")
+}
+
+// -----------------------------------------------------------------------------
+// Workflows — canvas state is stored as JSON blobs. The full definition is
+// serialized on save and rehydrated on load. Keeping it as JSON avoids a
+// complex relational model for a graph that is almost always loaded whole.
+// -----------------------------------------------------------------------------
+
+model Workflow {
+  id        String   @id @default(cuid())
+  userId    String
+  name      String   @default("Untitled")
+  nodes     Json     // serialized WorkflowCanvasNode[]
+  edges     Json     // serialized WorkflowCanvasEdge[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  runs WorkflowRun[]
+
+  @@index([userId, updatedAt(sort: Desc)])
+  @@map("workflows")
+}
+
+// -----------------------------------------------------------------------------
+// Execution history — one row per run of a workflow (full / selected / single).
+// -----------------------------------------------------------------------------
+
+enum RunScope {
+  FULL     // whole DAG
+  SELECTED // subset chosen by the user
+  SINGLE   // single node
+}
+
+enum RunStatus {
+  QUEUED
+  RUNNING
+  SUCCESS
+  FAILED
+  PARTIAL // at least one node succeeded while another failed
+  SKIPPED // node-level only — upstream produced no output, so this node didn't run
+}
+
+model WorkflowRun {
+  id          String    @id @default(cuid())
+  workflowId  String
+  userId      String
+  scope       RunScope
+  status      RunStatus @default(QUEUED)
+  /// Selected node ids when `scope = SELECTED`. null otherwise.
+  selection   Json?
+  startedAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  workflow Workflow  @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  nodeRuns NodeRun[]
+
+  @@index([workflowId, startedAt(sort: Desc)])
+  @@index([userId, startedAt(sort: Desc)])
+  @@map("workflow_runs")
+}
+
+// -----------------------------------------------------------------------------
+// Per-node execution record. Populated by the Trigger.dev tasks as they
+// progress.
+// -----------------------------------------------------------------------------
+
+model NodeRun {
+  id            String    @id @default(cuid())
+  workflowRunId String
+  /// Node id as it exists in the workflow graph (not the DB primary key).
+  nodeId        String
+  /// One of the `NodeKind` string literals ("text", "run-llm", ...).
+  nodeKind      String
+  status        RunStatus @default(QUEUED)
+  startedAt     DateTime?
+  completedAt   DateTime?
+  durationMs    Int?
+  /// Resolved input values at execution time.
+  inputs        Json?
+  /// Produced output(s).
+  outputs       Json?
+  errorMessage  String?
+
+  run WorkflowRun @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
+
+  @@index([workflowRunId])
+  @@map("node_runs")
+}
