@@ -17,13 +17,14 @@ import {
  * Executes a Gemini prompt. Inputs may include multiple images (as URLs or
  * `data:` URLs). The returned `output` is the plain-text model response.
  *
- * Resilience strategy (Gemini flagship models hit 503 "high demand" spikes
- * regularly on the free tier):
- *   1. Retry the user-selected model a few times with exponential backoff.
- *   2. If still 5xx, fall back to the next model in `FALLBACK_CHAIN`.
- *   3. Account-level errors (400/401/403/429) abort immediately — no retry,
- *      no fallback, since the message already explains the user-actionable
- *      cause (bad key, exhausted quota).
+ * Resilience strategy:
+ *   1. Retry the user-selected model a few times with exponential backoff
+ *      on 5xx (high-demand spikes clear in seconds).
+ *   2. On 5xx exhausted OR 429 (per-model quota), fall through to the next
+ *      model in `FALLBACK_CHAIN`. Free-tier quotas are per-model on Gemini,
+ *      so 429 on Flash doesn't mean Pro is also exhausted.
+ *   3. Config-level errors (400/401/403) abort immediately — retrying a
+ *      bad API key or malformed request will never succeed.
  */
 const PRIMARY_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 1500;
@@ -52,21 +53,19 @@ export const runLlmTask = task({
         const text = await callWithRetry(client, modelId, payload, parts);
         return { output: text };
       } catch (error) {
-        if (isAccountLevelError(error)) {
+        if (isConfigError(error)) {
+          // Bad key / disabled API — no amount of fallback fixes it.
           throw new AbortTaskRunError(formatGeminiError(error));
         }
+        // 429 (quota) + 5xx (overload) — try next model in chain.
         lastTransientError = error;
       }
     }
 
     throw new AbortTaskRunError(
-      `Gemini overloaded across all fallback models (${modelsToTry.join(
+      `All Gemini fallback models failed (${modelsToTry.join(
         ", ",
-      )}). Try again in a minute. Last error: ${
-        lastTransientError instanceof Error
-          ? lastTransientError.message
-          : String(lastTransientError)
-      }`,
+      )}). ${formatGeminiError(lastTransientError)}`,
     );
   },
 });
@@ -104,7 +103,12 @@ async function callWithRetry(
       return result.response.text();
     } catch (error) {
       attempt += 1;
-      if (isAccountLevelError(error) || attempt >= PRIMARY_RETRIES) throw error;
+      // Only 5xx is worth an in-model retry. 4xx (config or quota) doesn't
+      // resolve by retrying the same model — surface it so the outer loop
+      // either aborts (config) or moves to the next model (quota).
+      if (!isTransientServerError(error) || attempt >= PRIMARY_RETRIES) {
+        throw error;
+      }
       await sleep(jitteredBackoff(attempt));
     }
   }
@@ -136,21 +140,27 @@ function requireEnv(name: string): string {
 
 /**
  * Gemini's SDK throws an Error whose message starts with the HTTP status.
- * Account-level: 400 (invalid key/request), 401, 403 (disabled), 429 (quota).
- * Transient (retry / fallback worthy): 5xx, network.
+ *   - 400 (malformed), 401 (bad key), 403 (disabled) = no recovery, abort.
+ *   - 429 (quota) = per-model bucket, try next model in fallback chain.
+ *   - 5xx / network = high-demand spike, in-model retry then fallback.
  */
-function isAccountLevelError(error: unknown): boolean {
+function isConfigError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
-  return /\b(400|401|403|429)\b/.test(error.message);
+  return /\b(400|401|403)\b/.test(error.message);
+}
+
+function isTransientServerError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return /\b5\d{2}\b/.test(error.message);
 }
 
 function formatGeminiError(error: unknown): string {
   if (!(error instanceof Error)) return "Gemini request failed";
   if (error.message.includes("429")) {
-    return "Gemini quota exhausted — try a different model or enable billing on your Google Cloud project.";
+    return "Gemini free-tier quota exhausted on every fallback model. Wait a few minutes, enable billing on the Google Cloud project, or use a different API key.";
   }
   if (error.message.includes("403") || error.message.includes("401")) {
-    return "Gemini API key rejected — check GEMINI_API_KEY in .env.";
+    return "Gemini API key rejected — check GEMINI_API_KEY.";
   }
   return error.message;
 }
