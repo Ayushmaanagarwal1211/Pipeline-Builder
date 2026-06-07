@@ -1,56 +1,32 @@
-import { auth, currentUser } from "@clerk/nextjs/server";
-
-import { ApiError } from "@/lib/api/api-error";
 import { prisma } from "@/lib/db/prisma";
 
 /**
- * Clerk-backed auth for the API layer. Read the Clerk session, mirror the
- * user into Postgres on first access so every row that foreign-keys to
- * `users.id` has a valid target, then hand the Clerk user id back to the
- * caller. Unauthenticated calls surface as 401 via `ApiError`.
- *
- * The page layer's middleware (`proxy.ts`) already redirects unauthenticated
- * browser navigations — `ensureCurrentUser` covers the narrow window where an
- * expired token reaches an API route directly.
+ * Login has been removed from the app — there is no Clerk session and every
+ * request is treated as the same single local user. These helpers keep the
+ * existing API surface (`getCurrentUserId` / `ensureCurrentUser`) so route
+ * handlers stay unchanged, while resolving to a fixed user id that every row
+ * foreign-keying to `users.id` can safely reference.
  */
+const LOCAL_USER = {
+  id: "local-user",
+  email: "local@nextflow.app",
+  name: "Local User",
+} as const;
+
+/** Returns the fixed local user id. Never throws — there is no auth to fail. */
 export async function getCurrentUserId(): Promise<string> {
-  const { userId } = await auth();
-  if (!userId) throw ApiError.unauthorized();
-  return userId;
+  return LOCAL_USER.id;
 }
 
 /**
- * Returns the Clerk user id and guarantees a matching `users` row exists.
- * Idempotent — the first call populates name/email from Clerk, subsequent
- * calls skip the Clerk roundtrip.
+ * Guarantees the single local `users` row exists and returns its id.
+ * Idempotent via upsert, so concurrent first-access calls are safe.
  */
 export async function ensureCurrentUser(): Promise<string> {
-  const id = await getCurrentUserId();
-
-  const existing = await prisma.user.findUnique({
-    where: { id },
-    select: { id: true },
+  await prisma.user.upsert({
+    where: { id: LOCAL_USER.id },
+    update: {},
+    create: { id: LOCAL_USER.id, email: LOCAL_USER.email, name: LOCAL_USER.name },
   });
-  if (existing) return id;
-
-  const clerkUser = await currentUser();
-  await prisma.user.create({
-    data: {
-      id,
-      email: clerkUser?.primaryEmailAddress?.emailAddress ?? null,
-      name: deriveDisplayName(clerkUser),
-    },
-  });
-  return id;
-}
-
-function deriveDisplayName(
-  user: Awaited<ReturnType<typeof currentUser>>,
-): string | null {
-  if (!user) return null;
-  if (user.fullName) return user.fullName;
-  if (user.firstName || user.lastName) {
-    return [user.firstName, user.lastName].filter(Boolean).join(" ");
-  }
-  return user.username ?? null;
+  return LOCAL_USER.id;
 }

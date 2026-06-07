@@ -1,6 +1,5 @@
 "use client";
 
-import { UserButton } from "@clerk/nextjs";
 import {
   ChevronDown,
   Check,
@@ -139,14 +138,6 @@ function TopBarActions() {
       <PillButton icon={<Sparkles className="size-3.5 text-orange-400" />}>
         Turn workflow into app
       </PillButton>
-
-      <div className="ml-1 flex size-8 items-center justify-center rounded-full bg-card/90 shadow-sm backdrop-blur">
-        <UserButton
-          appearance={{
-            elements: { avatarBox: "size-7" },
-          }}
-        />
-      </div>
     </div>
   );
 }
